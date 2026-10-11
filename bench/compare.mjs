@@ -1,11 +1,13 @@
 // Compare two proj4 bundles for identical output and speed.
 // node bench/compare.mjs <base.js> <head.js> [--browser]
+import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 
 const args = process.argv.slice(2);
 const browser = args.includes('--browser');
+const perfArg = args.find(a => a.startsWith('--perf='));
 const [basePath, headPath] = args.filter(a => !a.startsWith('--')).map(p => resolve(p));
 if (!basePath || !headPath) {
   console.error('usage: node bench/compare.mjs <base.js> <head.js> [--browser]');
@@ -13,7 +15,10 @@ if (!basePath || !headPath) {
 }
 
 // Runs in Node and in the browser page, so it must stay self-contained.
-function suite(libs, mode) {
+// Without `only`, checks output for all pairs; with `only`, times that one pair.
+// Timing each pair in a fresh process or page keeps call sites as monomorphic
+// as in an app that uses a single pair.
+function suite(libs, mode, only) {
   var DEFS = {
     UTM33N: '+proj=utm +zone=33 +datum=WGS84 +units=m +no_defs',
     UTM33S: '+proj=utm +zone=33 +south +datum=WGS84 +units=m +no_defs',
@@ -81,7 +86,7 @@ function suite(libs, mode) {
     return typeof a === 'number' && a !== b ? Math.abs(a - b) : 0;
   }
 
-  var correctness = PAIRS.map(function (pair) {
+  var correctness = (only === undefined ? PAIRS : []).map(function (pair) {
     var pts = sourcePoints(pair);
     var cb = base(pair[0], pair[1]), ch = head(pair[0], pair[1]);
     var pb = [base.Proj(pair[0]), base.Proj(pair[1])], ph = [head.Proj(pair[0]), head.Proj(pair[1])];
@@ -121,7 +126,7 @@ function suite(libs, mode) {
       }
     };
   }
-  var performance_ = PAIRS.map(function (pair) {
+  var performance_ = (only === undefined ? [] : [PAIRS[only]]).map(function (pair) {
     var pts = sourcePoints(pair);
     var fns = [loop(base(pair[0], pair[1]), pts), loop(head(pair[0], pair[1]), pts)];
     var samples = [[], []];
@@ -145,11 +150,11 @@ function suite(libs, mode) {
     });
     return { pair: pair[0] + ' -> ' + pair[1], base: med[0], head: med[1] };
   });
-  return { mode: mode, correctness: correctness, performance: performance_, sink: sink };
+  return { mode: mode, pairs: PAIRS.length, correctness: correctness, performance: performance_, sink: sink };
 }
 
 function report(r) {
-  if (r.correctness) {
+  if (r.correctness.length) {
     console.log('\n### Output: base vs head (' + r.mode + ')\n');
     console.log('| pair | calls | shape diffs | max abs diff x/y | max abs diff z |');
     console.log('|---|---:|---:|---:|---:|');
@@ -163,7 +168,10 @@ function report(r) {
       }
     });
   }
-  console.log('\n### Speed: 10k points via converter.forward, median of 31 (' + r.mode + ')\n');
+  if (!r.performance.length) {
+    return;
+  }
+  console.log('\n### Speed: 10k points via converter.forward, median of 31, each pair in a fresh ' + (r.mode.startsWith('Node') ? 'process' : 'page') + ' (' + r.mode + ')\n');
   console.log('| pair | base ms | head ms | speedup |');
   console.log('|---|---:|---:|---:|');
   r.performance.forEach(function (p) {
@@ -172,18 +180,45 @@ function report(r) {
 }
 
 const require = createRequire(import.meta.url);
-const nodeResult = suite([require(basePath), require(headPath)], 'Node ' + process.version);
-report(nodeResult);
+const libs = () => [require(basePath), require(headPath)];
+const nodeMode = 'Node ' + process.version;
+if (perfArg) {
+  process.stdout.write(JSON.stringify(suite(libs(), nodeMode, +perfArg.slice(7))));
+  process.exit(0);
+}
+
+const checked = suite(libs(), nodeMode);
+report(checked);
+const perPair = (run) => {
+  const out = [];
+  for (let i = 0; i < checked.pairs; i++) {
+    out.push(run(i));
+  }
+  return out;
+};
+const merge = results => Promise.all(results).then(rs => ({
+  mode: rs[0].mode, correctness: [], performance: rs.flatMap(r => r.performance)
+}));
+
+report(await merge(perPair(i => JSON.parse(execFileSync(process.execPath, [import.meta.filename, basePath, headPath, '--perf=' + i], { encoding: 'utf8' })))));
 
 if (browser) {
   const { chromium } = await import('playwright');
   const b = await chromium.launch(process.env.CHROME ? { executablePath: process.env.CHROME } : {});
-  const page = await b.newPage();
-  for (const [file, name] of [[basePath, 'proj4Base'], [headPath, 'proj4Head']]) {
-    await page.addScriptTag({ content: readFileSync(file, 'utf8') + '\nwindow.' + name + ' = proj4;' });
+  const runPage = async (i) => {
+    const context = await b.newContext();
+    const page = await context.newPage();
+    for (const [file, name] of [[basePath, 'proj4Base'], [headPath, 'proj4Head']]) {
+      await page.addScriptTag({ content: readFileSync(file, 'utf8') + '\nwindow.' + name + ' = proj4;' });
+    }
+    const r = await page.evaluate('(' + suite.toString() + ')([proj4Base, proj4Head], "Chromium " + navigator.userAgent.match(/Chrome\\/([\\d.]+)/)[1], ' + i + ')');
+    await context.close();
+    return r;
+  };
+  const results = [];
+  for (let i = 0; i < checked.pairs; i++) {
+    results.push(await runPage(i));
   }
-  const r = await page.evaluate('(' + suite.toString() + ')([proj4Base, proj4Head], "Chromium " + navigator.userAgent.match(/Chrome\\/([\\d.]+)/)[1])');
-  delete r.correctness;
-  report(r);
+  report(await merge(results));
   await b.close();
 }
