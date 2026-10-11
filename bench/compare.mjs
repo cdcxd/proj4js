@@ -1,5 +1,5 @@
 // Compare two proj4 bundles for identical output and speed.
-// node bench/compare.mjs <base.js> <head.js> [--browser]
+// node bench/compare.mjs <base.js> <head.js> [--browser] [--runs=N]
 import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
 import { readFileSync } from 'fs';
@@ -8,9 +8,10 @@ import { resolve } from 'path';
 const args = process.argv.slice(2);
 const browser = args.includes('--browser');
 const perfArg = args.find(a => a.startsWith('--perf='));
+const runs = +(args.find(a => a.startsWith('--runs=')) || '--runs=1').slice(7);
 const [basePath, headPath] = args.filter(a => !a.startsWith('--')).map(p => resolve(p));
 if (!basePath || !headPath) {
-  console.error('usage: node bench/compare.mjs <base.js> <head.js> [--browser]');
+  console.error('usage: node bench/compare.mjs <base.js> <head.js> [--browser] [--runs=N]');
   process.exit(1);
 }
 
@@ -171,7 +172,7 @@ function report(r) {
   if (!r.performance.length) {
     return;
   }
-  console.log('\n### Speed: 10k points via converter.forward, median of 31, each pair in a fresh ' + (r.mode.startsWith('Node') ? 'process' : 'page') + ' (' + r.mode + ')\n');
+  console.log('\n### Speed: 10k points via converter.forward, median of 31, mean of ' + r.runs + ' fresh ' + (r.mode.startsWith('Node') ? 'processes' : 'pages') + ' per pair (' + r.mode + ')\n');
   console.log('| pair | base ms | head ms | speedup |');
   console.log('|---|---:|---:|---:|');
   r.performance.forEach(function (p) {
@@ -189,18 +190,24 @@ if (perfArg) {
 
 const checked = suite(libs(), nodeMode);
 report(checked);
-const perPair = (run) => {
-  const out = [];
+const averaged = async (runOnce) => {
+  const performance = [];
+  let mode;
   for (let i = 0; i < checked.pairs; i++) {
-    out.push(run(i));
+    const p = { base: 0, head: 0 };
+    for (let k = 0; k < runs; k++) {
+      const r = await runOnce(i);
+      mode = r.mode;
+      p.pair = r.performance[0].pair;
+      p.base += r.performance[0].base / runs;
+      p.head += r.performance[0].head / runs;
+    }
+    performance.push(p);
   }
-  return out;
+  return { mode: mode, runs: runs, correctness: [], performance: performance };
 };
-const merge = results => Promise.all(results).then(rs => ({
-  mode: rs[0].mode, correctness: [], performance: rs.flatMap(r => r.performance)
-}));
 
-report(await merge(perPair(i => JSON.parse(execFileSync(process.execPath, [import.meta.filename, basePath, headPath, '--perf=' + i], { encoding: 'utf8' })))));
+report(await averaged(async i => JSON.parse(execFileSync(process.execPath, [import.meta.filename, basePath, headPath, '--perf=' + i], { encoding: 'utf8' }))));
 
 if (browser) {
   const { chromium } = await import('playwright');
@@ -215,10 +222,6 @@ if (browser) {
     await context.close();
     return r;
   };
-  const results = [];
-  for (let i = 0; i < checked.pairs; i++) {
-    results.push(await runPage(i));
-  }
-  report(await merge(results));
+  report(await averaged(runPage));
   await b.close();
 }
